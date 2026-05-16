@@ -83,33 +83,44 @@ def test_first_call_returns_q_current():
     np.testing.assert_array_equal(result, q)
 
 
-def test_plans_after_three_observations():
-    ctrl, *_ = _make_controller()
+def test_plans_after_eight_observations():
+    """Planning now triggers at >= 8 observations (not 3)."""
+    ctrl, pred, *_ = _make_controller()
     q = np.array([0.5, 0.5])
-    ctrl.step({}, q)  # 1st obs
-    ctrl.step({}, q)  # 2nd obs
-    result = ctrl.step({}, q)  # 3rd obs, plans, returns traj[0]
+    # First 7 should not plan
+    for _ in range(7):
+        ctrl.step({}, q)
+    assert pred.call_count == 0  # predictor not called in _estimate (ball.x=1.0 < ROBOT_X=1.3 always)
+    assert not ctrl._planned
+    # 8th triggers planning
+    result = ctrl.step({}, q)
+    assert ctrl._planned
+    # At t_elapsed=0, interpolation returns traj[0] = [1.0, 1.0]
     np.testing.assert_array_equal(result, np.array([1.0, 1.0]))
 
 
-def test_replays_trajectory():
+def test_time_based_interpolation():
+    """Trajectory is interpolated by elapsed time, not step index."""
     ctrl, *_ = _make_controller()
     q = np.array([0.5, 0.5])
-    ctrl.step({}, q)  # 1st obs
-    ctrl.step({}, q)  # 2nd obs
-    ctrl.step({}, q)  # 3rd obs, plans, returns traj[0]
-    r2 = ctrl.step({}, q)  # traj[1]
-    r3 = ctrl.step({}, q)  # traj[2]
-    np.testing.assert_array_equal(r2, np.array([2.0, 2.0]))
-    np.testing.assert_array_equal(r3, np.array([3.0, 3.0]))
+    # 8 steps to trigger planning (timestamps 0.1..0.8, plan at t=0.8)
+    for _ in range(8):
+        ctrl.step({}, q)
+    # Next step: obs 9 at t=0.9, t_elapsed=0.1 -> interp at 0.1 -> [2,2]
+    r1 = ctrl.step({}, q)
+    np.testing.assert_array_almost_equal(r1, np.array([2.0, 2.0]))
+    # Next step: obs 10 at t=1.0, t_elapsed=0.2 -> interp at 0.2 -> [3,3]
+    r2 = ctrl.step({}, q)
+    np.testing.assert_array_almost_equal(r2, np.array([3.0, 3.0]))
 
 
 def test_holds_position_after_trajectory_ends():
     ctrl, *_ = _make_controller()
     q = np.array([0.5, 0.5])
-    for _ in range(6):
+    # 8 to plan + 3 more to exceed trajectory duration (0.2s = 2 more steps)
+    for _ in range(12):
         ctrl.step({}, q)
-    # Trajectory has 3 steps; calls 3-5 exhaust it, call 6 should hold
+    # t_elapsed = 0.4 > 0.2 trajectory duration, should hold
     result = ctrl.step({}, q)
     np.testing.assert_array_equal(result, q)
 
@@ -117,12 +128,10 @@ def test_holds_position_after_trajectory_ends():
 def test_plans_only_once():
     ctrl, pred, spin, aim, swing = _make_controller()
     q = np.array([0.5, 0.5])
-    for _ in range(10):
+    for _ in range(15):
         ctrl.step({}, q)
-    assert pred.call_count == 1
-    assert spin.call_count == 1
-    assert aim.call_count == 1
     assert swing.call_count == 1
+    assert aim.call_count == 1
 
 
 def test_reset_clears_state():
@@ -133,7 +142,7 @@ def test_reset_clears_state():
     ctrl.reset()
     assert ctrl._observations == []
     assert ctrl._trajectory is None
-    assert ctrl._step_index == 0
+    assert ctrl._plan_start_time == 0.0
     assert ctrl._planned is False
     # After reset, first call should hold again
     result = ctrl.step({}, q)

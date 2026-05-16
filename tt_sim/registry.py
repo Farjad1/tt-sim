@@ -32,6 +32,7 @@ REGISTRY = {
         "open_loop": "tt_sim.baselines.control.OpenLoopController",
         "reactive": "tt_sim.baselines.control.ReactiveController",
         "replan": "tt_sim.upgrades.control.ReplanController",
+        "mpc": "tt_sim.upgrades.control.MPCController",
     },
 }
 

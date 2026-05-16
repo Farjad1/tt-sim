@@ -23,17 +23,19 @@ ROBOT_CONFIGS = {
         "gear": np.array([600.0, 500.0, 160.0, 240.0, 20.0, 20.0, 8.0]),
         "init_qpos": np.array([1.907, 0.839, 1.214, 2.739, -0.534, -0.783, -1.392]),
         "joint_prefix": "wam/",
+        "robot_x": 1.3,   # intercept plane: base(2.1) - 0.8
     },
     "fanuc": {
         "ndof": 6,
         "xml": "table_tennis_fanuc.xml",
-        "gear": np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),  # direct torque
-        "init_qpos": np.array([-2.938, 1.339, -2.621, -2.009, -2.92, -2.819]),
+        "gear": np.array([500.0, 500.0, 300.0, 150.0, 80.0, 50.0]),
+        "init_qpos": np.array([-1.57, 0.8, -1.5, 0.0, -1.57, 0.0]),
         "joint_prefix": "fanuc/",
-        "gravity_comp": True,  # add qfrc_bias feedforward to torque command
-        "kp_scale": 400.0,     # PD position gain (per-joint, divided by gear)
-        "kd_scale": 40.0,      # PD velocity gain
+        "gravity_comp": True,
+        "kp_scale": 800.0,     # aggressive tracking for heavy arm
+        "kd_scale": 50.0,
         "reactive_kwargs": {"gain": 5.0, "damping": 0.01},
+        "robot_x": 1.0,   # intercept plane: base(1.6) - 0.6 (further from base = more time)
     },
 }
 
@@ -60,7 +62,7 @@ def extract_env_state(obs: np.ndarray, ndof: int, step_count: int, dt: float = 0
     return env_state, np.asarray(q_current, dtype=np.float64)
 
 
-def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None, reactive_kwargs=None):
+def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None, reactive_kwargs=None, robot_x=None):
     """Load and instantiate all subsystems via the registry."""
     PerceiverCls = registry.load("perceiver", perceiver)
     PredictorCls = registry.load("predictor", predictor)
@@ -70,16 +72,92 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
     ControlCls = registry.load("control", control)
 
     perc = PerceiverCls()
-    pred = PredictorCls()
+    # Pass sim-matched physics to DragBouncePredictor:
+    # MuJoCo has NO air drag and very elastic bounce (~0.97 COR)
+    from tt_sim.upgrades.prediction import DragBouncePredictor
+    if issubclass(PredictorCls, DragBouncePredictor):
+        pred = PredictorCls(c_d=0.0, restitution=0.91)
+    else:
+        pred = PredictorCls()
     spin_est = SpinCls()
     aim = AimerCls()
 
     # Some swing planners need the env (e.g., MujocoIKSwingPlanner)
     from tt_sim.baselines.swing import MujocoIKSwingPlanner
+    from tt_sim.upgrades.swing import QuinticSwingPlanner
     if issubclass(SwingCls, MujocoIKSwingPlanner):
         if env is None:
             raise click.ClickException(f"--swing={swing} requires the sim env (not available in --dry-run)")
         swng = SwingCls(env=env)
+    elif issubclass(SwingCls, QuinticSwingPlanner) and env is not None:
+        # Wire up MuJoCo IK and Jacobian for the quintic planner
+        import mujoco
+        model = env.unwrapped.model
+        n_joints = model.nu
+
+        def _mujoco_ik(target, q_seed=None, _model=model, _env=env, _nj=n_joints):
+            """Damped least-squares IK with position + orientation."""
+            d = mujoco.MjData(_model)
+            if q_seed is not None:
+                d.qpos[:_nj] = q_seed[:_nj].copy()
+            else:
+                d.qpos[:_nj] = _env.unwrapped.data.qpos[:_nj].copy()
+            mujoco.mj_forward(_model, d)
+            ee_id = mujoco.mj_name2id(_model, mujoco.mjtObj.mjOBJ_BODY, "EE")
+
+            # Orientation weight relative to position
+            w_ori = 0.5
+
+            for _ in range(200):
+                ee_pos = d.body("EE").xpos.copy()
+                pos_err = target.position - ee_pos
+
+                # Orientation error: align EE body Z-axis with target.normal
+                ee_rot = d.body("EE").xmat.reshape(3, 3)
+                paddle_z = ee_rot[:, 2]  # paddle face normal = body Z
+                desired_n = target.normal / (np.linalg.norm(target.normal) + 1e-10)
+                # Orientation error as cross product (small-angle approximation)
+                ori_err = np.cross(paddle_z, desired_n) * w_ori
+
+                # Stack into 6D error
+                err = np.concatenate([pos_err, ori_err])
+                if np.linalg.norm(pos_err) < 0.005 and np.linalg.norm(ori_err) < 0.02:
+                    break
+
+                # Full 6D Jacobian (position + rotation)
+                jacp = np.zeros((3, _model.nv))
+                jacr = np.zeros((3, _model.nv))
+                mujoco.mj_jacBody(_model, d, jacp, jacr, ee_id)
+                J = np.vstack([jacp[:, :_nj], jacr[:, :_nj]])
+
+                # Damped least squares
+                damping = 0.05
+                JJT = J @ J.T + damping**2 * np.eye(6)
+                dq = J.T @ np.linalg.solve(JJT, err)
+                # Limit step size to prevent large jumps (important for 6-DOF)
+                max_step = 0.2
+                dq_norm = np.linalg.norm(dq)
+                if dq_norm > max_step:
+                    dq = dq * (max_step / dq_norm)
+                d.qpos[:_nj] += dq
+                for i in range(_nj):
+                    lo, hi = _model.jnt_range[i]
+                    if lo != hi:
+                        d.qpos[i] = np.clip(d.qpos[i], lo, hi)
+                mujoco.mj_forward(_model, d)
+            return d.qpos[:_nj].copy()
+
+        def _mujoco_jac(q, _model=model, _nj=n_joints):
+            """Position Jacobian (3 x n_joints) at joint config q."""
+            d = mujoco.MjData(_model)
+            d.qpos[:_nj] = q[:_nj].copy()
+            mujoco.mj_forward(_model, d)
+            ee_id = mujoco.mj_name2id(_model, mujoco.mjtObj.mjOBJ_BODY, "EE")
+            jacp = np.zeros((3, _model.nv))
+            mujoco.mj_jacBody(_model, d, jacp, None, ee_id)
+            return jacp[:, :_nj]  # 3 x n_joints for Cartesian velocity mapping
+
+        swng = SwingCls(n_joints=n_joints, ik_fn=_mujoco_ik, jac_fn=_mujoco_jac)
     else:
         swng = SwingCls()
 
@@ -96,6 +174,18 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
         ctrl_kwargs["env"] = env
         if reactive_kwargs:
             ctrl_kwargs.update(reactive_kwargs)
+    else:
+        if robot_x is not None:
+            ctrl_kwargs["robot_x"] = robot_x
+
+    # MPC controller needs symbolic FK from MuJoCo model
+    from tt_sim.upgrades.control import MPCController
+    if issubclass(ControlCls, MPCController) and env is not None:
+        from tt_sim.upgrades.mpc_fk import build_fk_casadi
+        model = env.unwrapped.model
+        fk_dict = build_fk_casadi(model, n_joints)
+        ctrl_kwargs["fk_dict"] = fk_dict
+
     ctrl = ControlCls(**ctrl_kwargs)
     return ctrl, {
         "perceiver": perceiver,
@@ -177,7 +267,7 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
     click.echo(f"Config: {robot=}, {perceiver=}, {predictor=}, {spin=}, {aimer=}, {swing=}, {control=}, {episodes=}")
 
     if dry_run:
-        controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control)
+        controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control, robot_x=rcfg.get("robot_x"))
         click.echo("\n-- Dry run: subsystems loaded --")
         click.echo(f"  robot:          {robot} ({ndof}-DOF)")
         click.echo(f"  perceiver:      {type(controller.perceiver).__qualname__}")
@@ -221,7 +311,7 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
 
     env = gym.make(ENV_ID, render_mode=render_mode)
     reactive_kwargs = rcfg.get("reactive_kwargs", None)
-    controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=env, reactive_kwargs=reactive_kwargs)
+    controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=env, reactive_kwargs=reactive_kwargs, robot_x=rcfg.get("robot_x"))
     dt = env.unwrapped.dt
     logger = EvalLogger(log_path=log, config=config)
 
@@ -239,13 +329,8 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
     kp = rcfg.get("kp_scale", 50.0) / gear
     kd = rcfg.get("kd_scale", 5.0) / gear
 
-    # Widen action_space if robot needs torques/positions beyond [-1, 1].
-    # fancy_gym hardcodes Box(-1, 1, (7,)) for WAM; we override for Fanuc.
-    if use_gravity_comp:
-        from gymnasium.spaces import Box
-        act_dim = env.action_space.shape[0]
-        hi = np.full(act_dim, 500.0)  # match max ctrlrange
-        env.action_space = Box(-hi, hi, dtype=np.float32)
+    # Note: with gear ratios on all robots, ctrl range is [-1, 1] and
+    # gravity comp (qfrc_bias/gear) stays within that range.
 
     for ep in range(episodes):
         obs, info = env.reset()
@@ -263,8 +348,9 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
             action_raw = kp * (q_desired - q_current) - kd * q_vel
             if use_gravity_comp:
                 # Feedforward gravity+Coriolis compensation from MuJoCo
+                # qfrc_bias is in torque space; divide by gear to get control space
                 qfrc_bias = env.unwrapped.data.qfrc_bias[:ndof].copy()
-                action_raw = action_raw + qfrc_bias
+                action_raw = action_raw + qfrc_bias / gear
 
             # Pad to env action space and clip
             act_dim = env.action_space.shape[0]
@@ -278,6 +364,15 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             step_count += 1
+
+            # Track minimum paddle-ball distance for diagnostics
+            ee_pos = env.unwrapped.data.body("EE").xpos.copy()
+            ball_pos_now = obs[14:17]
+            pb_dist = np.linalg.norm(ee_pos - ball_pos_now)
+            if step_count == 1:
+                min_pb_dist = pb_dist
+            else:
+                min_pb_dist = min(min_pb_dist, pb_dist)
 
             # Render / record
             if render_mode == "rgb_array":
@@ -312,7 +407,7 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
         click.echo(
             f"Episode {ep + 1}/{episodes}: reward={reward:.3f}  "
             f"status={status}  land_dist_err={land_dist:.3f}  "
-            f"steps={step_count}"
+            f"min_pb_dist={min_pb_dist:.3f}  steps={step_count}"
         )
 
     logger.print_summary()

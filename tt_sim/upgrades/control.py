@@ -179,7 +179,7 @@ class MPCController(HighLevelController):
         dt_mpc: float = 0.032,
         max_iter: int = 80,
         w_pos: float = 1000.0,
-        w_ori: float = 10.0,
+        w_ori: float = 100.0,
         w_vel: float = 1.0,
         w_smooth: float = 0.01,
         w_effort: float = 0.001,
@@ -274,8 +274,9 @@ class MPCController(HighLevelController):
         q_end = get_q(N)
         p_ee = fk_fn(q_end)
         _, R_flat = fk_rot_fn(q_end)
-        R_ee = ca.reshape(R_flat, 3, 3)  # already row-major from our FK
-        z_ee = R_ee[:, 2]  # paddle face normal = EE body Z-axis
+        # R_flat is row-major [R00,R01,R02,R10,...,R22]
+        # Body Z-axis (column 2 of R) = [R02, R12, R22] = indices 2,5,8
+        z_ee = ca.vertcat(R_flat[2], R_flat[5], R_flat[8])
 
         # Position tracking
         pos_err = p_ee - target_pos

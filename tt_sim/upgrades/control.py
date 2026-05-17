@@ -462,3 +462,397 @@ class MPCController(HighLevelController):
         self._prev_solution = None
         self._solution_trajectory = None
         self._solution_start_time = None
+
+
+class TorqueMPCController(HighLevelController):
+    """Stage 2b – Torque-level receding-horizon MPC controller.
+
+    Unlike MPCController (position-level → PD), this controller directly outputs
+    torques in ctrl-space. The NLP includes full rigid-body dynamics constraints
+    (RNEA) so the optimizer produces physically consistent trajectories.
+
+    The high-level controller absorbs the low-level controller: no PD loop needed.
+    """
+
+    REPLAN_INTERVAL = 4
+    MIN_OBS = 4
+    DT = 0.008
+
+    torque_mode = True  # signals run.py to bypass PD loop
+
+    def __init__(
+        self,
+        perceiver: Perceiver,
+        predictor: Predictor,
+        spin_estimator: SpinEstimator,
+        aimer: Aimer,
+        swing_planner: SwingPlanner,
+        dynamics_dict: dict | None = None,
+        t_predict: float = 0.5,
+        robot_x: float = 1.3,
+        horizon_N: int = 10,
+        dt_mpc: float = 0.032,
+        max_iter: int = 100,
+        w_pos: float = 1000.0,
+        w_ori: float = 100.0,
+        w_vel: float = 1.0,
+        w_smooth: float = 0.01,
+        w_effort: float = 1e-8,
+        dq_max: float = 5.0,
+    ) -> None:
+        self.perceiver = perceiver
+        self.predictor = predictor
+        self.spin_estimator = spin_estimator
+        self.aimer = aimer
+        self.swing_planner = swing_planner
+        self.t_predict = t_predict
+        self.ROBOT_X = robot_x
+
+        self._observations: list[BallObservation] = []
+        self._frame_count = 0
+
+        # MPC params
+        self.N = horizon_N
+        self.dt_mpc = dt_mpc
+        self.max_iter = max_iter
+        self.dq_max = dq_max
+        self.weights = {
+            'pos': w_pos, 'ori': w_ori, 'vel': w_vel,
+            'smooth': w_smooth, 'effort': w_effort,
+        }
+
+        # Dynamics and NLP
+        self._dyn = dynamics_dict
+        self._nlp_solver = None
+        self._n_joints: int | None = None
+        self._joint_ranges: np.ndarray | None = None
+        self._gear: np.ndarray | None = None
+        self._damping: np.ndarray | None = None
+
+        # Warm-start
+        self._prev_x0: np.ndarray | None = None
+        # Torque trajectory for interpolation between replans
+        self._solution_times: np.ndarray | None = None
+        self._solution_tau: np.ndarray | None = None  # (N, nj) ctrl-space
+        self._solution_q: np.ndarray | None = None    # (N+1, nj) positions
+        self._solution_qd: np.ndarray | None = None   # (N+1, nj) velocities
+
+    def _build_nlp(self) -> None:
+        """Build torque-level CasADi NLP (called once)."""
+        import casadi as ca
+
+        nj = self._n_joints
+        N = self.N
+        w = self.weights
+
+        # Decision variables:
+        #   Q:   positions  q[1..N]    (N * nj)
+        #   QD:  velocities qd[1..N]   (N * nj)
+        #   TAU: torques    tau[0..N-1] (N * nj)
+        n_dec = 3 * N * nj
+        X = ca.SX.sym('X', n_dec)
+
+        def get_q(k):
+            """Position at knot k (k=0 is parameter)."""
+            if k == 0:
+                return q0_param
+            return X[(k - 1) * nj: k * nj]
+
+        def get_qd(k):
+            """Velocity at knot k (k=0 is parameter)."""
+            if k == 0:
+                return qd0_param
+            offset = N * nj
+            return X[offset + (k - 1) * nj: offset + k * nj]
+
+        def get_tau(k):
+            """Torque at knot k (k=0..N-1)."""
+            offset = 2 * N * nj
+            return X[offset + k * nj: offset + (k + 1) * nj]
+
+        # Parameters
+        q0_param = ca.SX.sym('q0', nj)
+        qd0_param = ca.SX.sym('qd0', nj)
+        target_pos = ca.SX.sym('target_pos', 3)
+        target_normal = ca.SX.sym('target_normal', 3)
+        target_dq = ca.SX.sym('target_dq', nj)
+        dt_param = ca.SX.sym('dt_param')
+
+        params = ca.vertcat(q0_param, qd0_param, target_pos, target_normal, target_dq, dt_param)
+
+        rnea_fn = self._dyn['rnea_fn']
+        fk_fn = self._dyn['fk_fn']
+        fk_rot_fn = self._dyn['fk_rot_fn']
+        damping = ca.SX(self._damping)
+
+        cost = 0
+        g = []
+        lbg = []
+        ubg = []
+
+        # Dynamics constraints: for k = 0..N-1
+        # qdd_k = (qd_{k+1} - qd_k) / dt
+        # tau_k = rnea(q_k, qd_k, qdd_k)  [RNEA includes gravity + Coriolis + inertia + damping]
+        for k in range(N):
+            q_k = get_q(k)
+            qd_k = get_qd(k)
+            q_k1 = get_q(k + 1)
+            qd_k1 = get_qd(k + 1)
+            tau_k = get_tau(k)
+
+            # Acceleration (finite difference)
+            qdd_k = (qd_k1 - qd_k) / dt_param
+
+            # Inverse dynamics: tau = RNEA(q, qd, qdd)
+            tau_rnea = rnea_fn(q_k, qd_k, qdd_k)
+
+            # Dynamics constraint: tau_k = tau_rnea
+            g.append(tau_k - tau_rnea)
+            lbg += [0.0] * nj
+            ubg += [0.0] * nj
+
+            # Position integration (semi-implicit Euler): q_{k+1} = q_k + dt * qd_{k+1}
+            g.append(q_k1 - q_k - dt_param * qd_k1)
+            lbg += [0.0] * nj
+            ubg += [0.0] * nj
+
+            # Running cost: torque effort
+            cost += w['effort'] * ca.dot(tau_k, tau_k)
+
+            # Torque smoothness (for k >= 1)
+            if k >= 1:
+                tau_prev = get_tau(k - 1)
+                dtau = tau_k - tau_prev
+                cost += w['smooth'] * ca.dot(dtau, dtau)
+
+        # Terminal costs
+        q_end = get_q(N)
+        qd_end = get_qd(N)
+        p_ee = fk_fn(q_end)
+        _, R_flat = fk_rot_fn(q_end)
+        z_ee = ca.vertcat(R_flat[2], R_flat[5], R_flat[8])
+
+        pos_err = p_ee - target_pos
+        cost += w['pos'] * ca.dot(pos_err, pos_err)
+
+        ori_err = ca.cross(z_ee, target_normal)
+        cost += w['ori'] * ca.dot(ori_err, ori_err)
+
+        vel_err = qd_end - target_dq
+        cost += w['vel'] * ca.dot(vel_err, vel_err)
+
+        # Bounds on decision variables
+        lbx = []
+        ubx = []
+        gear = self._gear
+
+        # Q bounds (positions): N * nj
+        for k in range(N):
+            for j in range(nj):
+                lbx.append(float(self._joint_ranges[j, 0]))
+                ubx.append(float(self._joint_ranges[j, 1]))
+
+        # QD bounds (velocities): N * nj
+        for k in range(N):
+            for j in range(nj):
+                lbx.append(-self.dq_max)
+                ubx.append(self.dq_max)
+
+        # TAU bounds (torques): N * nj — bounded by actuator limits (gear ratios)
+        for k in range(N):
+            for j in range(nj):
+                lbx.append(-float(gear[j]))
+                ubx.append(float(gear[j]))
+
+        nlp = {'x': X, 'f': cost, 'g': ca.vertcat(*g), 'p': params}
+        opts = {
+            'ipopt.max_iter': self.max_iter,
+            'ipopt.print_level': 0,
+            'print_time': 0,
+            'ipopt.warm_start_init_point': 'yes',
+            'ipopt.mu_init': 1e-3,
+            'ipopt.tol': 1e-4,
+        }
+        self._nlp_solver = ca.nlpsol('torque_mpc', 'ipopt', nlp, opts)
+        self._lbx = lbx
+        self._ubx = ubx
+        self._lbg = lbg
+        self._ubg = ubg
+
+    def _solve(
+        self,
+        q_current: np.ndarray,
+        qd_current: np.ndarray,
+        target_pos: np.ndarray,
+        target_normal: np.ndarray,
+        target_dq: np.ndarray,
+        dt_mpc: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Solve the NLP. Returns (q_traj (N,nj), qd_traj (N,nj), tau_traj (N,nj))."""
+        nj = self._n_joints
+        N = self.N
+
+        p_val = np.concatenate([
+            q_current, qd_current, target_pos, target_normal, target_dq, [dt_mpc]
+        ])
+
+        # Initial guess
+        if self._prev_x0 is not None:
+            x0 = self._prev_x0.copy()
+            # Shift warm-start forward by one step
+            # Q block
+            for k in range(N - 1):
+                x0[k * nj:(k + 1) * nj] = self._prev_x0[(k + 1) * nj:(k + 2) * nj]
+            x0[(N - 1) * nj:N * nj] = self._prev_x0[(N - 1) * nj:N * nj]
+            # QD block
+            off = N * nj
+            for k in range(N - 1):
+                x0[off + k * nj:off + (k + 1) * nj] = self._prev_x0[off + (k + 1) * nj:off + (k + 2) * nj]
+            x0[off + (N - 1) * nj:off + N * nj] = self._prev_x0[off + (N - 1) * nj:off + N * nj]
+            # TAU block
+            off2 = 2 * N * nj
+            for k in range(N - 1):
+                x0[off2 + k * nj:off2 + (k + 1) * nj] = self._prev_x0[off2 + (k + 1) * nj:off2 + (k + 2) * nj]
+            x0[off2 + (N - 1) * nj:off2 + N * nj] = self._prev_x0[off2 + (N - 1) * nj:off2 + N * nj]
+        else:
+            # Hold current position, zero velocity, gravity-comp torque
+            x0 = np.zeros(3 * N * nj)
+            # Q: tile current position
+            for k in range(N):
+                x0[k * nj:(k + 1) * nj] = q_current
+            # QD: zero (already)
+            # TAU: gravity compensation at current config
+            g_tau = np.array(self._dyn['gravity_fn'](q_current)).flatten()
+            off2 = 2 * N * nj
+            for k in range(N):
+                x0[off2 + k * nj:off2 + (k + 1) * nj] = g_tau
+
+        sol = self._nlp_solver(
+            x0=x0, lbx=self._lbx, ubx=self._ubx,
+            lbg=self._lbg, ubg=self._ubg, p=p_val,
+        )
+
+        X_opt = np.array(sol['x']).flatten()
+        self._prev_x0 = X_opt.copy()
+
+        q_traj = X_opt[:N * nj].reshape(N, nj)
+        qd_traj = X_opt[N * nj:2 * N * nj].reshape(N, nj)
+        tau_traj = X_opt[2 * N * nj:].reshape(N, nj)
+
+        return q_traj, qd_traj, tau_traj
+
+    def _estimate_intercept_time(self) -> float:
+        """Estimate when the ball will reach ROBOT_X."""
+        if len(self._observations) < 2:
+            return self._observations[-1].timestamp + self.t_predict
+
+        o_last = self._observations[-1]
+        t_now = o_last.timestamp
+
+        try:
+            dt_sample = 0.004
+            n_samples = int(self.t_predict / dt_sample)
+            for i in range(1, n_samples + 1):
+                t_probe = t_now + i * dt_sample
+                state = self.predictor.predict(self._observations, t_probe)
+                if state.position[0] >= self.ROBOT_X:
+                    return t_probe
+        except Exception:
+            pass
+
+        o0 = self._observations[0]
+        dt = o_last.timestamp - o0.timestamp
+        if dt < 1e-6:
+            return t_now + self.t_predict
+        vx = (o_last.position[0] - o0.position[0]) / dt
+        if vx < 0.1:
+            return t_now + self.t_predict
+        dx = self.ROBOT_X - o_last.position[0]
+        return t_now + dx / vx
+
+    def step(self, env_state: dict, q_current: np.ndarray, qd_current: np.ndarray | None = None) -> np.ndarray:
+        """Return ctrl-space torques (torque / gear, clipped to [-1, 1])."""
+        if qd_current is None:
+            qd_current = np.zeros_like(q_current)
+
+        obs = self.perceiver.observe(env_state)
+        self._observations.append(obs)
+        self._frame_count += 1
+
+        if self._n_joints is None:
+            self._n_joints = len(q_current)
+            if self._dyn is not None:
+                self._joint_ranges = self._dyn['joint_ranges']
+                self._gear = self._dyn['gear_ratios']
+                self._damping = self._dyn['joint_damping']
+                self._build_nlp()
+
+        should_replan = (
+            self._dyn is not None
+            and self._nlp_solver is not None
+            and len(self._observations) >= self.MIN_OBS
+            and self._frame_count % self.REPLAN_INTERVAL == 0
+        )
+
+        if should_replan:
+            t_intercept = self._estimate_intercept_time()
+            ball_state = self.predictor.predict(self._observations, t_intercept)
+            ball_state.position[2] = np.clip(ball_state.position[2], 0.76, 2.0)
+            spin = self.spin_estimator.estimate(self._observations)
+            paddle_target = self.aimer.aim(ball_state, spin)
+            t_remaining = max(t_intercept - obs.timestamp, 0.05)
+            paddle_target.t_contact = t_remaining
+
+            dt_mpc = max(t_remaining / self.N, 0.008)
+
+            # Desired joint velocity from paddle Cartesian velocity
+            target_dq = np.zeros(self._n_joints)
+            if (paddle_target.velocity is not None
+                    and np.linalg.norm(paddle_target.velocity) > 1e-8):
+                J_val = np.array(self._dyn['fk_fn'].jacobian()(
+                    q_current, np.zeros(3)))
+                J = J_val[:3, :self._n_joints]
+                damping_ik = 0.01
+                JJT = J @ J.T + damping_ik**2 * np.eye(3)
+                target_dq = J.T @ np.linalg.solve(JJT, paddle_target.velocity)
+
+            q_traj, qd_traj, tau_traj = self._solve(
+                q_current, qd_current,
+                paddle_target.position, paddle_target.normal,
+                target_dq, dt_mpc,
+            )
+
+            # Store solution for interpolation
+            times = np.array([obs.timestamp + (k + 1) * dt_mpc for k in range(self.N)])
+            self._solution_times = times
+            self._solution_tau = tau_traj  # (N, nj) in torque space (Nm)
+
+        # Interpolate torque at current time
+        if self._solution_times is not None and self._solution_tau is not None:
+            t_now = obs.timestamp
+            # Find the appropriate knot — use the first knot that's >= t_now
+            # or the last knot if we've passed the horizon
+            tau = np.array([
+                np.interp(t_now, self._solution_times, self._solution_tau[:, j])
+                for j in range(self._n_joints)
+            ])
+            # Convert to ctrl space: ctrl = tau / gear
+            ctrl = tau / self._gear
+            return np.clip(ctrl, -1.0, 1.0)
+
+        # No solution yet: gravity compensation to hold position
+        if self._dyn is not None and self._gear is not None:
+            g_tau = np.array(self._dyn['gravity_fn'](q_current)).flatten()
+            ctrl = g_tau / self._gear
+            return np.clip(ctrl, -1.0, 1.0)
+        return np.zeros_like(q_current)
+
+    def reset(self) -> None:
+        """Clear state between rallies."""
+        self._observations.clear()
+        self._frame_count = 0
+        self._prev_x0 = None
+        self._solution_times = None
+        self._solution_tau = None
+        self._solution_q = None
+        self._solution_qd = None

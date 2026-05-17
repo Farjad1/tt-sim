@@ -33,6 +33,7 @@ REGISTRY = {
         "reactive": "tt_sim.baselines.control.ReactiveController",
         "replan": "tt_sim.upgrades.control.ReplanController",
         "mpc": "tt_sim.upgrades.control.MPCController",
+        "torque_mpc": "tt_sim.upgrades.control.TorqueMPCController",
     },
 }
 

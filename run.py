@@ -40,8 +40,8 @@ ROBOT_CONFIGS = {
 }
 
 
-def extract_env_state(obs: np.ndarray, ndof: int, step_count: int, dt: float = 0.008) -> tuple[dict, np.ndarray]:
-    """Extract env_state dict and q_current from observation.
+def extract_env_state(obs: np.ndarray, ndof: int, step_count: int, dt: float = 0.008) -> tuple[dict, np.ndarray, np.ndarray]:
+    """Extract env_state dict, q_current, and qd_current from observation.
 
     fancy_gym always outputs 19D obs (hardcoded for 7-DOF WAM):
       obs[0:7]    -> qpos[0:7] (for 6-DOF, index 6 = tar_x ball joint)
@@ -51,7 +51,7 @@ def extract_env_state(obs: np.ndarray, ndof: int, step_count: int, dt: float = 0
     We extract only the first ndof entries for robot joints.
     """
     q_current = obs[0:ndof].copy()
-    q_vel = obs[7:7 + ndof].copy()  # always at offset 7 (fancy_gym hardcoded)
+    qd_current = obs[7:7 + ndof].copy()  # always at offset 7 (fancy_gym hardcoded)
     ball_pos = obs[14:17].copy()
 
     env_state = {
@@ -59,7 +59,7 @@ def extract_env_state(obs: np.ndarray, ndof: int, step_count: int, dt: float = 0
         "time": float(step_count * dt),
     }
 
-    return env_state, np.asarray(q_current, dtype=np.float64)
+    return env_state, np.asarray(q_current, dtype=np.float64), np.asarray(qd_current, dtype=np.float64)
 
 
 def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None, reactive_kwargs=None, robot_x=None):
@@ -185,6 +185,14 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
         model = env.unwrapped.model
         fk_dict = build_fk_casadi(model, n_joints)
         ctrl_kwargs["fk_dict"] = fk_dict
+
+    # Torque MPC needs full dynamics (RNEA) from MuJoCo model
+    from tt_sim.upgrades.control import TorqueMPCController
+    if issubclass(ControlCls, TorqueMPCController) and env is not None:
+        from tt_sim.upgrades.mpc_dynamics import build_dynamics_casadi
+        model = env.unwrapped.model
+        dynamics_dict = build_dynamics_casadi(model, n_joints)
+        ctrl_kwargs["dynamics_dict"] = dynamics_dict
 
     ctrl = ControlCls(**ctrl_kwargs)
     return ctrl, {
@@ -340,17 +348,21 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
         step_count = 0
 
         while not done:
-            env_state, q_current = extract_env_state(obs, ndof, step_count, dt)
-            q_desired = controller.step(env_state, q_current)
+            env_state, q_current, qd_current = extract_env_state(obs, ndof, step_count, dt)
 
-            # Convert q_desired to torque action (PD control + optional gravity comp)
-            q_vel = obs[7:7 + ndof]  # velocities always at offset 7
-            action_raw = kp * (q_desired - q_current) - kd * q_vel
-            if use_gravity_comp:
-                # Feedforward gravity+Coriolis compensation from MuJoCo
-                # qfrc_bias is in torque space; divide by gear to get control space
-                qfrc_bias = env.unwrapped.data.qfrc_bias[:ndof].copy()
-                action_raw = action_raw + qfrc_bias / gear
+            # Torque-mode controllers output ctrl-space torques directly
+            if getattr(controller, 'torque_mode', False):
+                action_raw = controller.step(env_state, q_current, qd_current)
+            else:
+                q_desired = controller.step(env_state, q_current)
+
+                # Convert q_desired to torque action (PD control + optional gravity comp)
+                action_raw = kp * (q_desired - q_current) - kd * qd_current
+                if use_gravity_comp:
+                    # Feedforward gravity+Coriolis compensation from MuJoCo
+                    # qfrc_bias is in torque space; divide by gear to get control space
+                    qfrc_bias = env.unwrapped.data.qfrc_bias[:ndof].copy()
+                    action_raw = action_raw + qfrc_bias / gear
 
             # Pad to env action space and clip
             act_dim = env.action_space.shape[0]

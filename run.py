@@ -83,14 +83,14 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
     aim = AimerCls()
 
     # Some swing planners need the env (e.g., MujocoIKSwingPlanner)
-    from tt_sim.baselines.swing import MujocoIKSwingPlanner
+    from tt_sim.baselines.swing import MujocoIKSwingPlanner, LerpSwingPlanner
     from tt_sim.upgrades.swing import QuinticSwingPlanner
     if issubclass(SwingCls, MujocoIKSwingPlanner):
         if env is None:
             raise click.ClickException(f"--swing={swing} requires the sim env (not available in --dry-run)")
         swng = SwingCls(env=env)
-    elif issubclass(SwingCls, QuinticSwingPlanner) and env is not None:
-        # Wire up MuJoCo IK and Jacobian for the quintic planner
+    elif issubclass(SwingCls, (QuinticSwingPlanner, LerpSwingPlanner)) and env is not None:
+        # Wire up MuJoCo IK (and Jacobian for quintic) for swing planners
         import mujoco
         model = env.unwrapped.model
         n_joints = model.nu
@@ -157,7 +157,11 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
             mujoco.mj_jacBody(_model, d, jacp, None, ee_id)
             return jacp[:, :_nj]  # 3 x n_joints for Cartesian velocity mapping
 
-        swng = SwingCls(n_joints=n_joints, ik_fn=_mujoco_ik, jac_fn=_mujoco_jac)
+        if issubclass(SwingCls, QuinticSwingPlanner):
+            swng = SwingCls(n_joints=n_joints, ik_fn=_mujoco_ik, jac_fn=_mujoco_jac)
+        else:
+            # LerpSwingPlanner — just needs IK
+            swng = SwingCls(n_joints=n_joints, ik_fn=_mujoco_ik)
     else:
         swng = SwingCls()
 
@@ -183,6 +187,7 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
     if issubclass(ControlCls, MPCController) and env is not None:
         from tt_sim.upgrades.mpc_fk import build_fk_casadi
         model = env.unwrapped.model
+        n_joints = model.nu
         fk_dict = build_fk_casadi(model, n_joints)
         ctrl_kwargs["fk_dict"] = fk_dict
 
@@ -191,6 +196,8 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
     if issubclass(ControlCls, TorqueMPCController) and env is not None:
         from tt_sim.upgrades.mpc_dynamics import build_dynamics_casadi
         model = env.unwrapped.model
+        if 'n_joints' not in dir():
+            n_joints = model.nu
         dynamics_dict = build_dynamics_casadi(model, n_joints)
         ctrl_kwargs["dynamics_dict"] = dynamics_dict
 

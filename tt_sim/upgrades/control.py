@@ -939,13 +939,9 @@ class TubeTorqueMPCController(TorqueMPCController):
         As, Bs = [], []
         for k in range(N):
             # q_traj[k] is q at knot k+1, tau_traj[k] is tau at knot k
-            # Linearize at (q_k, qd_k, tau_k)
-            if k == 0:
-                q_k = self._nominal_q_start
-                qd_k = self._nominal_qd_start
-            else:
-                q_k = q_traj[k - 1]
-                qd_k = qd_traj[k - 1]
+            # Linearize at (q_k, qd_k, tau_k) — use nominal_q which has start prepended
+            q_k = self._nominal_q[k]    # knot k (index 0 = start state)
+            qd_k = self._nominal_qd[k]  # knot k
             A, B = lin_fn(q_k, qd_k, tau_traj[k])
             As.append(A)
             Bs.append(B)
@@ -963,25 +959,19 @@ class TubeTorqueMPCController(TorqueMPCController):
         if qd_current is None:
             qd_current = np.zeros_like(q_current)
 
-        # Store state before replan check (for gain computation)
-        self._nominal_q_start = q_current.copy()
-        self._nominal_qd_start = qd_current.copy()
-
         # Call parent step to get nominal control
         ctrl = super().step(env_state, q_current, qd_current)
 
         # After parent replans, compute tube gains from its solution
         if (self._solution_tau is not None and self._tube_gains is None
-                and self._n_joints is not None):
+                and self._n_joints is not None and self._nominal_q is not None):
             try:
-                q_traj = self._solution_tau  # parent stores tau in _solution_tau
-                # Need to recover q/qd from parent solve — store during _solve override
-                if self._nominal_q is not None:
-                    dt_mpc = (self._solution_times[1] - self._solution_times[0]) if len(self._solution_times) > 1 else 0.032
-                    self._tube_gains = self._compute_tube_gains(
-                        self._nominal_q[1:], self._nominal_qd[1:],
-                        self._nominal_tau, dt_mpc
-                    )
+                dt_mpc = (self._solution_times[1] - self._solution_times[0]) if len(self._solution_times) > 1 else 0.032
+                self._tube_gains = self._compute_tube_gains(
+                    self._nominal_q[1:], self._nominal_qd[1:],
+                    self._nominal_tau, dt_mpc
+                )
+                self._tube_dt_mpc = dt_mpc
             except Exception:
                 self._tube_gains = None
 
@@ -998,13 +988,24 @@ class TubeTorqueMPCController(TorqueMPCController):
             qd_nom = self._nominal_qd[k_idx + 1]
             dx = np.concatenate([q_current - q_nom, qd_current - qd_nom])
 
-            # Only correct small deviations (within expected tube)
-            if np.linalg.norm(dx[:nj]) < 0.2:
-                tau_correction = -K_k @ dx
-                max_correction = self._gear * 0.05
-                tau_correction = np.clip(tau_correction, -max_correction, max_correction)
-                # Add correction in ctrl space
-                ctrl_correction = tau_correction / self._gear
-                ctrl = np.clip(ctrl + ctrl_correction, -1.0, 1.0)
+            # Scale correction: gains computed at dt_mpc, applied at dt (8ms)
+            # dt_ratio accounts for substep mismatch; correction_gain for tuning
+            dt_ratio = self.DT / self._tube_dt_mpc
+            correction_gain = 0.1  # conservative: 10% of computed correction
+            
+            # Zero out velocity deviation — velocity mismatch between MPC knots
+            # and actual substeps is structural (interpolation artifact), not a
+            # disturbance. Only correct position tracking errors.
+            dx[nj:] = 0.0
+            
+            tau_correction = -correction_gain * dt_ratio * K_k @ dx
+
+            # Clip correction (max 5% of gear capacity per control step)
+            max_correction = self._gear * 0.05
+            tau_correction = np.clip(tau_correction, -max_correction, max_correction)
+
+            # Add correction in ctrl space
+            ctrl_correction = tau_correction / self._gear
+            ctrl = np.clip(ctrl + ctrl_correction, -1.0, 1.0)
 
         return ctrl

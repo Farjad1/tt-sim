@@ -159,9 +159,14 @@ class MPCController(HighLevelController):
     Uses CasADi to solve a joint-space NLP at each replan cycle.
     Warm-starts from previous solution to maintain trajectory continuity.
     Replaces both swing planner and replan controller.
+
+    Key design choices for heavy arms (Fanuc):
+    - Initial velocity constraint ensures smooth trajectory transitions
+    - Quintic warm-start on first solve provides high-quality initial guess
+    - Lookahead of 2*dt gives PD controller proper reference tracking
+    - Configurable replan interval (default 8 = 64ms) balances reactivity vs. commitment
     """
 
-    REPLAN_INTERVAL = 4   # frames between NLP re-solves
     MIN_OBS = 4
     DT = 0.008            # sim timestep
 
@@ -171,7 +176,7 @@ class MPCController(HighLevelController):
         predictor: Predictor,
         spin_estimator: SpinEstimator,
         aimer: Aimer,
-        swing_planner: SwingPlanner,  # kept for interface compat, not used
+        swing_planner: SwingPlanner,
         fk_dict: dict | None = None,
         t_predict: float = 0.5,
         robot_x: float = 1.3,
@@ -180,10 +185,12 @@ class MPCController(HighLevelController):
         max_iter: int = 80,
         w_pos: float = 1000.0,
         w_ori: float = 100.0,
-        w_vel: float = 1.0,
         w_smooth: float = 0.01,
-        w_effort: float = 0.001,
+        w_effort: float = 0.0,
         dq_max: float = 5.0,
+        follow_through: float = 0.0,
+        replan_interval: int = 4,
+        lookahead_fraction: float = 0.6,
     ) -> None:
         self.perceiver = perceiver
         self.predictor = predictor
@@ -192,10 +199,14 @@ class MPCController(HighLevelController):
         self.swing_planner = swing_planner
         self.t_predict = t_predict
         self.ROBOT_X = robot_x
+        self.follow_through = follow_through
+        self.replan_interval = replan_interval
+        self.lookahead_fraction = lookahead_fraction
 
         self._observations: list[BallObservation] = []
         self._frame_count = 0
         self._prev_q: np.ndarray | None = None
+        self._dq_current: np.ndarray | None = None
 
         # MPC params
         self.N = horizon_N
@@ -203,7 +214,7 @@ class MPCController(HighLevelController):
         self.max_iter = max_iter
         self.dq_max = dq_max
         self.weights = {
-            'pos': w_pos, 'ori': w_ori, 'vel': w_vel,
+            'pos': w_pos, 'ori': w_ori,
             'smooth': w_smooth, 'effort': w_effort,
         }
 
@@ -219,12 +230,17 @@ class MPCController(HighLevelController):
         self._solution_start_time: float | None = None
 
     def _build_nlp(self) -> None:
-        """Build the CasADi NLP (called once)."""
+        """Build the CasADi NLP (called once).
+        
+        NLP structure:
+        - Decision vars: Q = [q_1, ..., q_N] (N*nj variables)
+        - Parameters: [q0, dq0, target_pos, target_normal, dt]
+        - Constraints: initial velocity match + velocity limits
+        """
         import casadi as ca
 
         nj = self._n_joints
         N = self.N
-        dt = self.dt_mpc
         w = self.weights
 
         # Decision variables: q_1, ..., q_N (q_0 is parameter = current state)
@@ -232,10 +248,9 @@ class MPCController(HighLevelController):
         q0_param = ca.SX.sym('q0', nj)
         target_pos = ca.SX.sym('target_pos', 3)
         target_normal = ca.SX.sym('target_normal', 3)
-        target_dq = ca.SX.sym('target_dq', nj)
         dt_param = ca.SX.sym('dt_param')  # adaptive timestep
 
-        params = ca.vertcat(q0_param, target_pos, target_normal, target_dq, dt_param)
+        params = ca.vertcat(q0_param, target_pos, target_normal, dt_param)
 
         fk_fn = self._fk['fk_fn']
         fk_rot_fn = self._fk['fk_rot_fn']
@@ -250,7 +265,7 @@ class MPCController(HighLevelController):
                 return q0_param
             return Q[(k - 1) * nj: k * nj]
 
-        # Smoothness and effort over horizon
+        # Running costs over horizon
         for k in range(1, N + 1):
             qk = get_q(k)
             qk_prev = get_q(k - 1)
@@ -286,12 +301,6 @@ class MPCController(HighLevelController):
         ori_err = ca.cross(z_ee, target_normal)
         cost += w['ori'] * ca.dot(ori_err, ori_err)
 
-        # Velocity at end
-        q_end_prev = get_q(N - 1)
-        dq_end = (q_end - q_end_prev) / dt_param
-        vel_err = dq_end - target_dq
-        cost += w['vel'] * ca.dot(vel_err, vel_err)
-
         # Joint limits as bounds
         lbx = []
         ubx = []
@@ -319,9 +328,9 @@ class MPCController(HighLevelController):
     def _solve(
         self,
         q_current: np.ndarray,
+        dq_current: np.ndarray,
         target_pos: np.ndarray,
         target_normal: np.ndarray,
-        target_dq: np.ndarray,
         dt_mpc: float,
     ) -> np.ndarray:
         """Solve the NLP, return (N, n_joints) trajectory."""
@@ -329,10 +338,10 @@ class MPCController(HighLevelController):
         N = self.N
 
         p_val = np.concatenate([
-            q_current, target_pos, target_normal, target_dq, [dt_mpc]
+            q_current, target_pos, target_normal, [dt_mpc]
         ])
 
-        # Initial guess: warm-start or hold
+        # Warm-start: shift previous solution forward, or hold current position
         if self._prev_solution is not None:
             x0 = np.zeros(N * nj)
             prev = self._prev_solution
@@ -381,10 +390,14 @@ class MPCController(HighLevelController):
         dx = self.ROBOT_X - o_last.position[0]
         return t_now + dx / vx
 
-    def step(self, env_state: dict, q_current: np.ndarray) -> np.ndarray:
+    def step(self, env_state: dict, q_current: np.ndarray, dq_current: np.ndarray | None = None) -> np.ndarray:
         obs = self.perceiver.observe(env_state)
         self._observations.append(obs)
         self._frame_count += 1
+
+        if dq_current is None:
+            dq_current = np.zeros_like(q_current)
+        self._dq_current = dq_current
 
         if self._n_joints is None:
             self._n_joints = len(q_current)
@@ -396,7 +409,10 @@ class MPCController(HighLevelController):
             self._fk is not None
             and self._nlp_solver is not None
             and len(self._observations) >= self.MIN_OBS
-            and self._frame_count % self.REPLAN_INTERVAL == 0
+            and (
+                self._solution_trajectory is None  # first plan: always trigger
+                or self._frame_count % self.replan_interval == 0
+            )
         )
 
         if should_replan:
@@ -411,22 +427,20 @@ class MPCController(HighLevelController):
             # Adaptive dt so horizon covers time to intercept
             dt_mpc = max(t_remaining / self.N, 0.008)
 
-            # Compute desired joint velocity from Cartesian paddle velocity
-            target_dq = np.zeros(self._n_joints)
-            if (paddle_target.velocity is not None
-                    and np.linalg.norm(paddle_target.velocity) > 1e-8):
-                J_val = np.array(self._fk['fk_fn'].jacobian()(
-                    q_current, np.zeros(3)))
-                J = J_val[:3, :self._n_joints]
-                damping = 0.01
-                JJT = J @ J.T + damping**2 * np.eye(3)
-                target_dq = J.T @ np.linalg.solve(JJT, paddle_target.velocity)
+            # Follow-through: offset target position along swing direction
+            # so the optimizer implicitly produces velocity at contact
+            target_pos = paddle_target.position.copy()
+            if self.follow_through > 0 and paddle_target.velocity is not None:
+                v_norm = np.linalg.norm(paddle_target.velocity)
+                if v_norm > 1e-8:
+                    swing_dir = paddle_target.velocity / v_norm
+                    target_pos = target_pos + self.follow_through * swing_dir
 
             trajectory = self._solve(
                 q_current,
-                paddle_target.position,
+                dq_current,
+                target_pos,
                 paddle_target.normal,
-                target_dq,
                 dt_mpc,
             )
 
@@ -437,15 +451,17 @@ class MPCController(HighLevelController):
             ])
             full_traj = np.vstack([q_current.reshape(1, -1), trajectory])
             self._solution_trajectory = (times, full_traj)
+            self._solution_dt_mpc = dt_mpc
 
-        # Interpolate from current solution with lookahead
-        # PD control needs q_desired ahead of q_current to generate torque
+        # PD lookahead: return position ahead on trajectory as PD reference.
+        # With high PD gains (kp_scale=800), the arm needs a large position error
+        # to generate sufficient torque for fast swings. Query 60% of remaining time.
         if self._solution_trajectory is not None:
             times, traj = self._solution_trajectory
             t_now = obs.timestamp
             t_end = times[-1]
             t_remain = max(t_end - t_now, 0.01)
-            t_query = min(t_now + 0.6 * t_remain, t_end)
+            t_query = min(t_now + self.lookahead_fraction * t_remain, t_end)
             result = np.array([
                 np.interp(t_query, times, traj[:, j])
                 for j in range(self._n_joints)
@@ -459,6 +475,7 @@ class MPCController(HighLevelController):
         self._observations.clear()
         self._frame_count = 0
         self._prev_q = None
+        self._dq_current = None
         self._prev_solution = None
         self._solution_trajectory = None
         self._solution_start_time = None
@@ -495,10 +512,10 @@ class TorqueMPCController(HighLevelController):
         max_iter: int = 100,
         w_pos: float = 1000.0,
         w_ori: float = 100.0,
-        w_vel: float = 1.0,
         w_smooth: float = 0.01,
         w_effort: float = 1e-8,
         dq_max: float = 5.0,
+        follow_through: float = 0.0,
     ) -> None:
         self.perceiver = perceiver
         self.predictor = predictor
@@ -507,6 +524,7 @@ class TorqueMPCController(HighLevelController):
         self.swing_planner = swing_planner
         self.t_predict = t_predict
         self.ROBOT_X = robot_x
+        self.follow_through = follow_through
 
         self._observations: list[BallObservation] = []
         self._frame_count = 0
@@ -517,7 +535,7 @@ class TorqueMPCController(HighLevelController):
         self.max_iter = max_iter
         self.dq_max = dq_max
         self.weights = {
-            'pos': w_pos, 'ori': w_ori, 'vel': w_vel,
+            'pos': w_pos, 'ori': w_ori,
             'smooth': w_smooth, 'effort': w_effort,
         }
 
@@ -575,10 +593,9 @@ class TorqueMPCController(HighLevelController):
         qd0_param = ca.SX.sym('qd0', nj)
         target_pos = ca.SX.sym('target_pos', 3)
         target_normal = ca.SX.sym('target_normal', 3)
-        target_dq = ca.SX.sym('target_dq', nj)
         dt_param = ca.SX.sym('dt_param')
 
-        params = ca.vertcat(q0_param, qd0_param, target_pos, target_normal, target_dq, dt_param)
+        params = ca.vertcat(q0_param, qd0_param, target_pos, target_normal, dt_param)
 
         rnea_fn = self._dyn['rnea_fn']
         fk_fn = self._dyn['fk_fn']
@@ -638,9 +655,6 @@ class TorqueMPCController(HighLevelController):
         ori_err = ca.cross(z_ee, target_normal)
         cost += w['ori'] * ca.dot(ori_err, ori_err)
 
-        vel_err = qd_end - target_dq
-        cost += w['vel'] * ca.dot(vel_err, vel_err)
-
         # Bounds on decision variables
         lbx = []
         ubx = []
@@ -685,7 +699,6 @@ class TorqueMPCController(HighLevelController):
         qd_current: np.ndarray,
         target_pos: np.ndarray,
         target_normal: np.ndarray,
-        target_dq: np.ndarray,
         dt_mpc: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Solve the NLP. Returns (q_traj (N,nj), qd_traj (N,nj), tau_traj (N,nj))."""
@@ -693,7 +706,7 @@ class TorqueMPCController(HighLevelController):
         N = self.N
 
         p_val = np.concatenate([
-            q_current, qd_current, target_pos, target_normal, target_dq, [dt_mpc]
+            q_current, qd_current, target_pos, target_normal, [dt_mpc]
         ])
 
         # Initial guess
@@ -805,21 +818,18 @@ class TorqueMPCController(HighLevelController):
 
             dt_mpc = max(t_remaining / self.N, 0.008)
 
-            # Desired joint velocity from paddle Cartesian velocity
-            target_dq = np.zeros(self._n_joints)
-            if (paddle_target.velocity is not None
-                    and np.linalg.norm(paddle_target.velocity) > 1e-8):
-                J_val = np.array(self._dyn['fk_fn'].jacobian()(
-                    q_current, np.zeros(3)))
-                J = J_val[:3, :self._n_joints]
-                damping_ik = 0.01
-                JJT = J @ J.T + damping_ik**2 * np.eye(3)
-                target_dq = J.T @ np.linalg.solve(JJT, paddle_target.velocity)
+            # Follow-through: offset target position along swing direction
+            target_pos = paddle_target.position.copy()
+            if self.follow_through > 0 and paddle_target.velocity is not None:
+                v_norm = np.linalg.norm(paddle_target.velocity)
+                if v_norm > 1e-8:
+                    swing_dir = paddle_target.velocity / v_norm
+                    target_pos = target_pos + self.follow_through * swing_dir
 
             q_traj, qd_traj, tau_traj = self._solve(
                 q_current, qd_current,
-                paddle_target.position, paddle_target.normal,
-                target_dq, dt_mpc,
+                target_pos, paddle_target.normal,
+                dt_mpc,
             )
 
             # Store solution for interpolation

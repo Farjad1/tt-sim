@@ -62,7 +62,7 @@ def extract_env_state(obs: np.ndarray, ndof: int, step_count: int, dt: float = 0
     return env_state, np.asarray(q_current, dtype=np.float64), np.asarray(qd_current, dtype=np.float64)
 
 
-def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None, reactive_kwargs=None, robot_x=None):
+def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None, reactive_kwargs=None, robot_x=None, follow_through=0.0, lookahead_fraction=0.6):
     """Load and instantiate all subsystems via the registry."""
     PerceiverCls = registry.load("perceiver", perceiver)
     PredictorCls = registry.load("predictor", predictor)
@@ -190,6 +190,8 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
         n_joints = model.nu
         fk_dict = build_fk_casadi(model, n_joints)
         ctrl_kwargs["fk_dict"] = fk_dict
+        ctrl_kwargs["follow_through"] = follow_through
+        ctrl_kwargs["lookahead_fraction"] = lookahead_fraction
 
     # Torque MPC needs full dynamics (RNEA) from MuJoCo model
     from tt_sim.upgrades.control import TorqueMPCController
@@ -200,6 +202,7 @@ def load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=None,
             n_joints = model.nu
         dynamics_dict = build_dynamics_casadi(model, n_joints)
         ctrl_kwargs["dynamics_dict"] = dynamics_dict
+        ctrl_kwargs["follow_through"] = follow_through
 
     ctrl = ControlCls(**ctrl_kwargs)
     return ctrl, {
@@ -271,7 +274,9 @@ def monkey_patch_fancy_gym(xml_path: str, init_qpos: np.ndarray, ndof: int):
 @click.option("--render", is_flag=True, help="Open live MuJoCo viewer window.")
 @click.option("--record", default=None, type=str, help="Path to save mp4 video (e.g., results/demo.mp4).")
 @click.option("--original-scene", is_flag=True, help="Use original fancy_gym scene (ceiling-mounted WAM, no custom XML).")
-def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log, list_impls, dry_run, render, record, original_scene):
+@click.option("--follow-through", "follow_through", default=0.0, type=float, help="Follow-through distance (meters) for MPC target offset along swing direction.")
+@click.option("--lookahead", "lookahead_fraction", default=0.6, type=float, help="MPC lookahead as fraction of remaining time (0.0-1.0).")
+def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log, list_impls, dry_run, render, record, original_scene, follow_through, lookahead_fraction):
     """Run the tt-sim table tennis simulation."""
     if list_impls:
         registry.list_available()
@@ -282,7 +287,7 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
     click.echo(f"Config: {robot=}, {perceiver=}, {predictor=}, {spin=}, {aimer=}, {swing=}, {control=}, {episodes=}")
 
     if dry_run:
-        controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control, robot_x=rcfg.get("robot_x"))
+        controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control, robot_x=rcfg.get("robot_x"), follow_through=follow_through, lookahead_fraction=lookahead_fraction)
         click.echo("\n-- Dry run: subsystems loaded --")
         click.echo(f"  robot:          {robot} ({ndof}-DOF)")
         click.echo(f"  perceiver:      {type(controller.perceiver).__qualname__}")
@@ -326,7 +331,7 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
 
     env = gym.make(ENV_ID, render_mode=render_mode)
     reactive_kwargs = rcfg.get("reactive_kwargs", None)
-    controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=env, reactive_kwargs=reactive_kwargs, robot_x=rcfg.get("robot_x"))
+    controller, config = load_subsystems(perceiver, predictor, spin, aimer, swing, control, env=env, reactive_kwargs=reactive_kwargs, robot_x=rcfg.get("robot_x"), follow_through=follow_through, lookahead_fraction=lookahead_fraction)
     dt = env.unwrapped.dt
     logger = EvalLogger(log_path=log, config=config)
 
@@ -343,6 +348,10 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
     gear = rcfg["gear"]
     kp = rcfg.get("kp_scale", 50.0) / gear
     kd = rcfg.get("kd_scale", 5.0) / gear
+
+    # Check if controller.step accepts dq_current (MPC needs velocity continuity)
+    import inspect
+    _ctrl_accepts_dq = 'dq_current' in inspect.signature(controller.step).parameters
 
     # Note: with gear ratios on all robots, ctrl range is [-1, 1] and
     # gravity comp (qfrc_bias/gear) stays within that range.
@@ -361,7 +370,10 @@ def main(perceiver, predictor, spin, aimer, swing, control, robot, episodes, log
             if getattr(controller, 'torque_mode', False):
                 action_raw = controller.step(env_state, q_current, qd_current)
             else:
-                q_desired = controller.step(env_state, q_current)
+                if _ctrl_accepts_dq:
+                    q_desired = controller.step(env_state, q_current, dq_current=qd_current)
+                else:
+                    q_desired = controller.step(env_state, q_current)
 
                 # Convert q_desired to torque action (PD control + optional gravity comp)
                 action_raw = kp * (q_desired - q_current) - kd * qd_current

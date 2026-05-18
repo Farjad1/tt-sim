@@ -507,13 +507,13 @@ class TorqueMPCController(HighLevelController):
         dynamics_dict: dict | None = None,
         t_predict: float = 0.5,
         robot_x: float = 1.3,
-        horizon_N: int = 10,
+        horizon_N: int = 15,
         dt_mpc: float = 0.032,
-        max_iter: int = 100,
+        max_iter: int = 150,
         w_pos: float = 1000.0,
-        w_ori: float = 100.0,
+        w_ori: float = 0.0,
         w_smooth: float = 0.01,
-        w_effort: float = 1e-8,
+        w_effort: float = 0.0,
         dq_max: float = 5.0,
         follow_through: float = 0.0,
     ) -> None:
@@ -804,7 +804,10 @@ class TorqueMPCController(HighLevelController):
             self._dyn is not None
             and self._nlp_solver is not None
             and len(self._observations) >= self.MIN_OBS
-            and self._frame_count % self.REPLAN_INTERVAL == 0
+            and (
+                self._solution_times is None  # first plan: always trigger
+                or self._frame_count % self.REPLAN_INTERVAL == 0
+            )
         )
 
         if should_replan:

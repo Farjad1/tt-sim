@@ -28,6 +28,7 @@ def run_episodes_with_logging(
     swing_name: str,
     episodes: int = 5,
     robot: str = "fanuc",
+    save_dir: str | None = None,
 ) -> dict:
     """Run episodes and log q, dq, actions per timestep."""
     import gymnasium as gym
@@ -115,6 +116,17 @@ def run_episodes_with_logging(
         ep_data["hit"] = info.get("hit_ball", False)
         all_episodes.append(ep_data)
 
+        # Save to disk for offline analysis
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            np.savez(
+                os.path.join(save_dir, f"ep_{ep:03d}.npz"),
+                q=ep_data["q"],
+                dq=ep_data["dq"],
+                action=ep_data["action"],
+                ee_pos=ep_data["ee_pos"],
+            )
+
     env.close()
     return all_episodes
 
@@ -180,7 +192,7 @@ def main(episodes):
         click.echo(f"\n{'='*60}")
         click.echo(f"Running {label} ({episodes} episodes)...")
         click.echo(f"{'='*60}")
-        ep_data = run_episodes_with_logging(ctrl, swing, episodes=episodes)
+        ep_data = run_episodes_with_logging(ctrl, swing, episodes=episodes, save_dir=f"results/trajectories/{label.replace(' ', '_').lower()}")
         hits = sum(1 for e in ep_data if e["hit"])
         click.echo(f"  Contact: {hits}/{episodes}")
         metrics = compute_metrics(ep_data)

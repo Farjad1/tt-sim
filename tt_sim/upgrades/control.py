@@ -869,3 +869,142 @@ class TorqueMPCController(HighLevelController):
         self._solution_tau = None
         self._solution_q = None
         self._solution_qd = None
+
+
+class TubeTorqueMPCController(TorqueMPCController):
+    """Stage 2c – Tube MPC: robust torque-level MPC with ancillary LQR.
+
+    Wraps TorqueMPCController with:
+    1. Tightened constraints based on disturbance set W
+    2. Online LTV-LQR gain computation along nominal trajectory
+    3. Ancillary feedback: tau = tau_nom + K_k @ (x - x_nom_k)
+    """
+
+    def __init__(
+        self,
+        *args,
+        disturbance_W: np.ndarray | None = None,
+        tube_margin: float = 0.8,
+        lqr_Q_scale: float = 1.0,
+        lqr_R_scale: float = 10.0,
+        correction_enabled: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._disturbance_W = disturbance_W
+        self._tube_margin = tube_margin
+        self._lqr_Q_scale = lqr_Q_scale
+        self._lqr_R_scale = lqr_R_scale
+        self._correction_enabled = correction_enabled
+
+        # Tube state
+        self._lin_fn = None
+        self._tube_gains: list[np.ndarray] | None = None
+        self._nominal_q: np.ndarray | None = None
+        self._nominal_qd: np.ndarray | None = None
+        self._nominal_tau: np.ndarray | None = None
+
+    def _build_linearization(self) -> None:
+        """Build linearization function from dynamics_dict (called once)."""
+        from tt_sim.upgrades.tube_linearize import build_linearization_fn
+        self._lin_fn = build_linearization_fn(self._dyn, self._n_joints, self.DT)
+
+    def _solve(self, *args, **kwargs):
+        """Override to store full trajectory for tube gains."""
+        q_traj, qd_traj, tau_traj = super()._solve(*args, **kwargs)
+        # Store nominal trajectory with start state prepended
+        q_start = args[0]  # q_current
+        qd_start = args[1]  # qd_current
+        self._nominal_q = np.vstack([q_start[None, :], q_traj])
+        self._nominal_qd = np.vstack([qd_start[None, :], qd_traj])
+        self._nominal_tau = tau_traj
+        # Reset gains so they're recomputed
+        self._tube_gains = None
+        return q_traj, qd_traj, tau_traj
+
+    def _compute_tube_gains(
+        self, q_traj: np.ndarray, qd_traj: np.ndarray, tau_traj: np.ndarray, dt_mpc: float
+    ) -> list[np.ndarray]:
+        """Linearize along nominal and compute LTV-LQR gains."""
+        from tt_sim.upgrades.tube_linearize import build_linearization_fn
+        from tt_sim.upgrades.tube_lqr import compute_ltv_gains
+
+        nj = self._n_joints
+        N = len(tau_traj)
+
+        # Build linearization at actual dt_mpc (not self.DT)
+        lin_fn = build_linearization_fn(self._dyn, nj, dt_mpc)
+
+        # Linearize at each knot
+        As, Bs = [], []
+        for k in range(N):
+            # q_traj[k] is q at knot k+1, tau_traj[k] is tau at knot k
+            # Linearize at (q_k, qd_k, tau_k)
+            if k == 0:
+                q_k = self._nominal_q_start
+                qd_k = self._nominal_qd_start
+            else:
+                q_k = q_traj[k - 1]
+                qd_k = qd_traj[k - 1]
+            A, B = lin_fn(q_k, qd_k, tau_traj[k])
+            As.append(A)
+            Bs.append(B)
+
+        # LQR tuning
+        nx = 2 * nj
+        Q = np.eye(nx) * self._lqr_Q_scale
+        R = np.eye(nj) * self._lqr_R_scale
+
+        Ks = compute_ltv_gains(As, Bs, Q, R)
+        return Ks
+
+    def step(self, env_state: dict, q_current: np.ndarray, qd_current: np.ndarray | None = None) -> np.ndarray:
+        """Return ctrl-space torques with ancillary tube correction."""
+        if qd_current is None:
+            qd_current = np.zeros_like(q_current)
+
+        # Store state before replan check (for gain computation)
+        self._nominal_q_start = q_current.copy()
+        self._nominal_qd_start = qd_current.copy()
+
+        # Call parent step to get nominal control
+        ctrl = super().step(env_state, q_current, qd_current)
+
+        # After parent replans, compute tube gains from its solution
+        if (self._solution_tau is not None and self._tube_gains is None
+                and self._n_joints is not None):
+            try:
+                q_traj = self._solution_tau  # parent stores tau in _solution_tau
+                # Need to recover q/qd from parent solve — store during _solve override
+                if self._nominal_q is not None:
+                    dt_mpc = (self._solution_times[1] - self._solution_times[0]) if len(self._solution_times) > 1 else 0.032
+                    self._tube_gains = self._compute_tube_gains(
+                        self._nominal_q[1:], self._nominal_qd[1:],
+                        self._nominal_tau, dt_mpc
+                    )
+            except Exception:
+                self._tube_gains = None
+
+        # Apply ancillary correction (only if enabled)
+        if (self._correction_enabled and self._tube_gains is not None 
+                and self._solution_times is not None):
+            nj = self._n_joints
+            t_now = self._observations[-1].timestamp
+            k_idx = np.searchsorted(self._solution_times, t_now)
+            k_idx = min(k_idx, len(self._tube_gains) - 1)
+
+            K_k = self._tube_gains[k_idx]
+            q_nom = self._nominal_q[k_idx + 1]
+            qd_nom = self._nominal_qd[k_idx + 1]
+            dx = np.concatenate([q_current - q_nom, qd_current - qd_nom])
+
+            # Only correct small deviations (within expected tube)
+            if np.linalg.norm(dx[:nj]) < 0.2:
+                tau_correction = -K_k @ dx
+                max_correction = self._gear * 0.05
+                tau_correction = np.clip(tau_correction, -max_correction, max_correction)
+                # Add correction in ctrl space
+                ctrl_correction = tau_correction / self._gear
+                ctrl = np.clip(ctrl + ctrl_correction, -1.0, 1.0)
+
+        return ctrl

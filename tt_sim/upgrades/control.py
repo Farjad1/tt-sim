@@ -903,6 +903,9 @@ class TubeTorqueMPCController(TorqueMPCController):
         self._nominal_q: np.ndarray | None = None
         self._nominal_qd: np.ndarray | None = None
         self._nominal_tau: np.ndarray | None = None
+        # Low-pass filtered deviation (exponential moving average)
+        self._dx_filtered: np.ndarray | None = None
+        self._lpf_alpha: float = 0.3  # smoothing factor (0=ignore new, 1=no filter)
 
     def _build_linearization(self) -> None:
         """Build linearization function from dynamics_dict (called once)."""
@@ -920,6 +923,7 @@ class TubeTorqueMPCController(TorqueMPCController):
         self._nominal_tau = tau_traj
         # Reset gains so they're recomputed
         self._tube_gains = None
+        self._dx_filtered = None  # reset filter on replan (new nominal)
         return q_traj, qd_traj, tau_traj
 
     def _compute_tube_gains(
@@ -986,19 +990,24 @@ class TubeTorqueMPCController(TorqueMPCController):
             K_k = self._tube_gains[k_idx]
             q_nom = self._nominal_q[k_idx + 1]
             qd_nom = self._nominal_qd[k_idx + 1]
-            dx = np.concatenate([q_current - q_nom, qd_current - qd_nom])
+            dx_raw = np.concatenate([q_current - q_nom, qd_current - qd_nom])
 
-            # Scale correction: gains computed at dt_mpc, applied at dt (8ms)
-            # dt_ratio accounts for substep mismatch; correction_gain for tuning
+            # Zero out velocity deviation — structural interpolation mismatch
+            dx_raw[nj:] = 0.0
+
+            # Low-pass filter deviation to reject transient noise
+            # Only respond to persistent tracking errors, not single-step noise
+            if self._dx_filtered is None:
+                self._dx_filtered = dx_raw.copy()
+            else:
+                self._dx_filtered = (self._lpf_alpha * dx_raw 
+                                     + (1 - self._lpf_alpha) * self._dx_filtered)
+
+            # Scale correction: gains at dt_mpc, applied at dt
             dt_ratio = self.DT / self._tube_dt_mpc
-            correction_gain = 0.1  # conservative: 10% of computed correction
+            correction_gain = 0.1
             
-            # Zero out velocity deviation — velocity mismatch between MPC knots
-            # and actual substeps is structural (interpolation artifact), not a
-            # disturbance. Only correct position tracking errors.
-            dx[nj:] = 0.0
-            
-            tau_correction = -correction_gain * dt_ratio * K_k @ dx
+            tau_correction = -correction_gain * dt_ratio * K_k @ self._dx_filtered
 
             # Clip correction (max 5% of gear capacity per control step)
             max_correction = self._gear * 0.05

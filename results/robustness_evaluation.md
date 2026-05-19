@@ -56,11 +56,21 @@ Each controller architecture has a different **robustness profile**:
 
 | Architecture | Ball noise robust? | Swing noise robust? | Why |
 |---|:-:|:-:|---|
-| Quintic+OL | ✗ (plan-once) | ✓ (PD feedback) | PD rejects execution noise but can't fix planning errors |
-| Torque MPC | ~ (replans) | ✗ (open-loop between) | Replanning helps prediction but no execution feedback |
-| Tube MPC | ✓ (filtered LQR) | ✓ (filtered LQR) | Continuous feedback handles both planning and execution errors |
+| Quintic+OL | ✗ (plan-once) | ✓ (PD 125Hz) | PD rejects execution noise but can't fix planning errors |
+| Torque MPC | ~ (replans 31Hz) | ~ (31Hz feedback only) | Replan corrects planning errors; 32ms open-loop gaps between replans |
+| Tube MPC | ✓ (filtered LQR 125Hz) | ✓ (filtered LQR 125Hz) | Continuous 125Hz feedback handles both planning and execution errors |
 
-**Tube MPC is the only architecture robust to BOTH noise sources** — the exact scenario for real hardware with cheap sensors AND imprecise actuators.
+**Tube MPC is the only architecture with high-bandwidth feedback for BOTH noise sources.**
+
+### Feedback bandwidth comparison
+
+| Controller | Feedback rate | Mechanism | Open-loop gap |
+|---|---|---|---|
+| Quintic+OL | 125Hz | PD tracks position every 8ms | None (PD is continuous) |
+| Torque MPC | 31Hz | Replans NLP from actual state every 32ms | 24ms (3 steps uncorrected) |
+| Tube MPC | 125Hz | LQR corrects every 8ms between replans | None (ancillary fills gaps) |
+
+Between replans, Torque MPC applies time-indexed interpolated torques regardless of actual state. If noise pushes the arm off-nominal at step 1 of a replan interval, it takes until step 4 (24ms later) for the replan to detect and react. Tube MPC detects the deviation immediately and nudges back — 4× higher feedback bandwidth.
 
 ## Connection to Project Thesis
 
